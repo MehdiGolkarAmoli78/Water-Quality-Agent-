@@ -1,5 +1,5 @@
 """
-Water Quality Monitoring Application — Version 17
+Water Quality Monitoring Application — Version 18
 =====================================
 Sentinel-2 based automatic calculation of:
   - Water Turbidity (NDTI)
@@ -12,11 +12,12 @@ sequentially after the user selects an area of interest. The interface is
 designed for managers and non-technical decision-makers: no remote-sensing
 jargon, no parameter pickers, no processing logs.
 
-Version 17 adds embedded Persian chart typography, parameter-specific display
-thresholds, a separate coverage view and verified atomic cache writes.
+Version 18 repairs interrupted downloads, cache recovery, authentication retries
+and resume controls. Embedded Persian typography, parameter-specific display
+thresholds, the coverage view and validated atomic cache writes are retained.
 Scientific equations, geospatial events, exports and the AI agent are preserved.
 Launch in the existing environment with:
-    streamlit run code_water_monitoring_version_17_1405.py
+    streamlit run code_water_monitoring_version_18_1405.py
 """
 
 import os
@@ -49,7 +50,7 @@ import streamlit as st
 
 st.set_page_config(
     layout="wide",
-    page_title="سامانه پایش کیفیت آب | نسخه ۱۷",
+    page_title="سامانه پایش کیفیت آب | نسخه ۱۸",
     page_icon="🌊"
 )
 
@@ -1798,23 +1799,15 @@ BNAZANIN_FONT_DRIVE_ID = ""
 # Download settings
 MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2
-DOWNLOAD_TIMEOUT = 120
+DOWNLOAD_TIMEOUT = (10, 30)  # connect/read seconds; EE RPCs have their own deadline
+EE_RPC_TIMEOUT_MS = 30000
+EE_RPC_MAX_RETRIES = 0
 CHUNK_SIZE = 8192
 MIN_FILE_SIZE = 10000
 
 # --- Connection-loss handling -------------------------------------------------
-# When the internet drops, an Earth Engine call does not hang: it raises almost
-# instantly. The month loop used to catch that, mark the month as "failed" and
-# move straight on to the next month — so a short outage burned through every
-# remaining month in a couple of seconds, marking them all failed. A later
-# Resume then legitimately retried all of them, starting from the earliest,
-# which is exactly what looked like "the download went back to an earlier month
-# / started over".
-#
-# The fix is to recognise the outage and STOP: after this many consecutive
-# month failures the run halts immediately, leaving every month that was never
-# attempted completely untouched, so Resume continues from the exact point of
-# interruption instead of re-doing a long stretch of months.
+# Retry transient failures with bounded requests, then pause at the failed
+# month. Deterministic data/size/permission errors retain their actual cause.
 NETWORK_FAILURE_STREAK = 2
 
 # --- Session-independent download cache ---------------------------------------
@@ -1885,6 +1878,8 @@ if 'pending_run' not in st.session_state:
     # 'start' | 'resume' | None — a click arms the run, the next script run
     # executes it (so the page is fully rendered before processing begins)
     st.session_state.pending_run = None
+if 'last_run_error' not in st.session_state:
+    st.session_state.last_run_error = None
 if 'active_page' not in st.session_state:
     # Which of the four top-navigation pages is currently shown:
     # 'setup' | 'turbidity' | 'chlorophyll' | 'chat'
@@ -1894,34 +1889,64 @@ if 'active_page' not in st.session_state:
 # =============================================================================
 # Earth Engine Authentication
 # =============================================================================
-@st.cache_resource
 def initialize_earth_engine():
-    """Initialize Earth Engine"""
+    """Initialize a bounded EE transport; failed attempts must remain retryable."""
     try:
-        ee.Initialize()
-        return True, "Earth Engine initialized"
-    except Exception:
-        try:
+        import google.auth
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from google.oauth2.service_account import Credentials as ServiceCredentials
+        import httplib2
+
+        timeout_seconds = EE_RPC_TIMEOUT_MS / 1000.0
+
+        class BoundedAuthRequest(Request):
+            def __call__(self, url, method='GET', body=None, headers=None,
+                         timeout=None, **kwargs):
+                # EE's setDeadline does not cover OAuth token refresh. Bound
+                # that separate transport too, including an expired saved token.
+                limit = min(timeout, timeout_seconds) if isinstance(timeout, (int, float)) and timeout > 0 else timeout_seconds
+                return super().__call__(url, method=method, body=body,
+                                        headers=headers, timeout=limit, **kwargs)
+
+        # setDeadline rebuilds EE resources and cannot precede the first
+        # Initialize in current EE releases. A bounded public HTTP transport
+        # covers that first request; setDeadline is applied after initialization.
+        ee.data.setMaxRetries(EE_RPC_MAX_RETRIES)
+        with requests.Session() as auth_session:
+            auth_request = BoundedAuthRequest(session=auth_session)
             base64_key = os.environ.get('GOOGLE_EARTH_ENGINE_KEY_BASE64')
-
+            project = None
             if base64_key:
-                key_json = base64.b64decode(base64_key).decode()
-                key_data = json.loads(key_json)
-
-                key_file = tempfile.NamedTemporaryFile(suffix='.json', delete=False)
-                with open(key_file.name, 'w') as f:
-                    json.dump(key_data, f)
-
-                credentials = ee.ServiceAccountCredentials(key_data['client_email'], key_file.name)
-                ee.Initialize(credentials)
-                os.unlink(key_file.name)
-                return True, "Authenticated with Service Account"
+                key_data = json.loads(base64.b64decode(base64_key).decode())
+                credentials = ServiceCredentials.from_service_account_info(
+                    key_data, scopes=ee.oauth.SCOPES)
             else:
-                ee.Authenticate()
-                ee.Initialize()
-                return True, "Authenticated"
-        except Exception as auth_error:
-            return False, f"Auth failed: {str(auth_error)}"
+                # Read saved credentials without EE's unbounded token check.
+                # Ambient Google credentials remain supported when no saved
+                # Earth Engine refresh token exists; no interactive login runs.
+                try:
+                    saved_credentials = ee.oauth.get_credentials_arguments()
+                except OSError:
+                    saved_credentials = {}
+                if saved_credentials.get('refresh_token'):
+                    credentials = Credentials(token=None, **saved_credentials)
+                    project = (saved_credentials.get('quota_project_id')
+                               or ee.oauth.get_appdefault_project())
+                    if project and project != credentials.quota_project_id:
+                        credentials = credentials.with_quota_project(project)
+                else:
+                    credentials, project = google.auth.default(
+                        scopes=ee.oauth.SCOPES, request=auth_request)
+                    project = getattr(credentials, 'quota_project_id', None) or project
+            credentials.refresh(auth_request)
+
+        transport = httplib2.Http(timeout=timeout_seconds)
+        ee.Initialize(credentials, http_transport=transport, project=project)
+        ee.data.setDeadline(EE_RPC_TIMEOUT_MS)
+        return True, "Earth Engine initialized"
+    except Exception as auth_error:
+        return False, f"Earth Engine initialization failed: {auth_error}"
 
 
 # =============================================================================
@@ -2117,6 +2142,7 @@ def _prepare_monitoring_run(config):
     st.session_state.processing_complete = False
     st.session_state.processing_in_progress = True
     st.session_state.resume_after_interruption = False
+    st.session_state.last_run_error = None
     st.session_state.pending_run = 'start'
 
 
@@ -2134,25 +2160,84 @@ def _cache_dir_for_active_run(config):
     return get_cache_dir_for_config(config)
 
 
+def _failure_message(error):
+    """Keep the cause useful without displaying signed URL query credentials."""
+    import re
+    message = str(error).strip() or type(error).__name__
+    return re.sub(r'(https?://[^?\s]+)\?[^\s]+', r'\1?[redacted]', message)[:1500]
+
+
+def _is_transient_error(error):
+    message = _failure_message(error).lower()
+    return isinstance(error, (ConnectionError, TimeoutError, requests.exceptions.Timeout,
+                              requests.exceptions.ConnectionError)) or any(
+        token in message for token in (
+            'timeout', 'timed out', 'connection', 'temporar', 'network', 'dns',
+            'remote end closed', 'reset by peer', 'deadline exceeded', 'rate limit',
+            'too many requests', '429', '500', '502', '503', '504', 'service unavailable',
+        )
+    )
+
+
+def _retry_ee_request(request):
+    """Retry a transient metadata error without losing the current month."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return request()
+        except Exception as error:
+            if not _is_transient_error(error) or attempt == MAX_RETRIES - 1:
+                raise
+            time.sleep(RETRY_DELAY_BASE ** (attempt + 1))
+
+
+def _recover_interrupted_run():
+    """A new script execution cannot inherit a lock from an abandoned one."""
+    if st.session_state.processing_config is None:
+        st.session_state.pending_run = None
+        st.session_state.processing_in_progress = False
+        return
+    if st.session_state.processing_in_progress and not st.session_state.get('pending_run'):
+        st.session_state.processing_in_progress = False
+        st.session_state.resume_after_interruption = bool(st.session_state.processing_config)
+
+
 def _execute_monitoring_run(config, resume):
-    """Do not clear the resume flag on Streamlit's BaseException rerun/stop signals."""
+    """Always release controls; a failed run resumes only on an explicit click."""
     st.session_state.pending_run = None
     st.session_state.processing_in_progress = True
     st.session_state.resume_after_interruption = False
+    st.session_state.last_run_error = None
     try:
-        aoi = ee.Geometry.Polygon([config['polygon_coords']])
-        success = run_full_analysis(aoi, config['start_date'], config['end_date'],
+        aoi = None
+
+        def resolve_aoi():
+            nonlocal aoi
+            if aoi is None:
+                ee_ok, ee_msg = initialize_earth_engine()
+                st.session_state.ee_initialized = ee_ok
+                if not ee_ok:
+                    raise ConnectionError(ee_msg)
+                aoi = ee.Geometry.Polygon([config['polygon_coords']])
+            return aoi
+
+        # Restoring complete TIFFs/thumbnails (including RGB assembly) is local.
+        # Authenticate only if a missing month actually requires a server call.
+        success = run_full_analysis(resolve_aoi, config['start_date'], config['end_date'],
                                     config.get('cloudy_pixel_percentage', CLOUD_THRESHOLD),
                                     config.get('scale', 10), resume=resume)
         st.session_state.processing_complete = bool(success or _has_any_results())
         if not success and not _has_any_results() and not st.session_state.resume_after_interruption:
             st.warning('داده‌ای برای این منطقه و بازه زمانی یافت نشد.')
-    except Exception:
+    except Exception as error:
         st.session_state.resume_after_interruption = True
+        st.session_state.last_run_error = _failure_message(error)
         st.error('پایش کامل نشد. فایل‌های دریافت‌شده حفظ شده‌اند؛ دکمه «ادامه از محل قطع» را بزنید.')
-    # Deliberately outside finally: a rerun/stop must leave the run resumable,
-    # just like the reference app's automatic processing_in_progress recovery.
-    st.session_state.processing_in_progress = False
+    except BaseException:
+        # Streamlit rerun/stop signals must propagate, but never leave the UI locked.
+        st.session_state.resume_after_interruption = True
+        raise
+    finally:
+        st.session_state.processing_in_progress = False
 
 
 def reset_run_cache(cache_dir):
@@ -2197,9 +2282,8 @@ def validate_geotiff_file(file_path, expected_bands=1):
         if not os.path.exists(file_path):
             return False, "File does not exist"
 
-        file_size = os.path.getsize(file_path)
-        if file_size < MIN_FILE_SIZE:
-            return False, f"File too small ({file_size} bytes)"
+        if os.path.getsize(file_path) == 0:
+            return False, "File is empty"
 
         with rasterio.open(file_path) as src:
             if src.count < expected_bands:
@@ -2460,11 +2544,6 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10):
         except Exception:
             pass
 
-    try:
-        region = aoi.bounds().getInfo()['coordinates']
-    except Exception as e:
-        return False, f"AOI bounds error: {e}"
-
     temp_path = output_path + '.tmp'
     if os.path.exists(temp_path):
         os.remove(temp_path)
@@ -2472,7 +2551,11 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10):
     last_error = None
 
     for attempt in range(MAX_RETRIES):
+        response = None
         try:
+            # Bounds and URL generation are network calls too. Retry them with
+            # the band, rather than failing permanently before the retry loop.
+            region = aoi.bounds().getInfo()['coordinates']
             url = image.select(band).getDownloadURL({
                 'scale': scale, 'region': region, 'format': 'GEO_TIFF', 'bands': [band]
             })
@@ -2486,15 +2569,14 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10):
                     raise Exception(last_error)
 
                 downloaded_size = 0
+                started = time.monotonic()
                 with open(temp_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                        if time.monotonic() - started > 180:
+                            raise requests.exceptions.Timeout('Band transfer exceeded 180 seconds')
                         if chunk:
                             f.write(chunk)
                             downloaded_size += len(chunk)
-
-                if downloaded_size < MIN_FILE_SIZE:
-                    last_error = f"File too small ({downloaded_size} bytes)"
-                    raise Exception(last_error)
 
                 is_valid, msg = validate_geotiff_file(temp_path, expected_bands=1)
                 if is_valid:
@@ -2514,8 +2596,10 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10):
         except requests.exceptions.ConnectionError:
             last_error = "Connection error"
         except Exception as e:
-            if last_error is None:
-                last_error = str(e)
+            last_error = _failure_message(e)
+        finally:
+            if response is not None:
+                response.close()
 
         for f in [output_path, temp_path]:
             if os.path.exists(f):
@@ -2836,6 +2920,16 @@ def process_single_parameter(aoi, start_date, end_date, parameter_type, temp_dir
         rgb_path = os.path.join(temp_dir, f"rgb_{param_short}_{month_name}.tif")
         wq_valid, _ = validate_geotiff_file(wq_path, expected_bands=1)
         rgb_valid, _ = validate_geotiff_file(rgb_path, expected_bands=3)
+        # A disconnect/rerun can arrive after the last source band was saved
+        # but before RGB assembly. Finish that local work before querying EE.
+        if wq_valid and not rgb_valid:
+            bands_dir = os.path.join(temp_dir, f"bands_{param_short}_{month_name}")
+            if all(validate_geotiff_file(os.path.join(bands_dir, f"{band}.tif"), 1)[0]
+                   for band in ('B4', 'B3', 'B2')):
+                _, _, recovered_status, _ = download_monthly_data(
+                    None, aoi, temp_dir, month_name, param_short, scale
+                )
+                rgb_valid = recovered_status == STATUS_COMPLETE
         if wq_valid and rgb_valid:
             downloaded_months[month_name] = {'wq_index': wq_path, 'rgb': rgb_path}
             st.session_state.downloaded_months[parameter_type][month_name] = downloaded_months[month_name]
@@ -2871,14 +2965,7 @@ def process_single_parameter(aoi, start_date, end_date, parameter_type, temp_dir
         progress_callback(processed_count, total_months, None)
 
     # ------------------------------------------------------------------
-    # FIX B: Per-month EE + download loop with immediate session state writes
-    #
-    # A month that fails when the connection is gone fails INSTANTLY (Earth
-    # Engine raises straight away rather than hanging). Counting consecutive
-    # failures therefore tells us the link is down within a second or two, and
-    # the loop stops there instead of racing through — and failing — every
-    # remaining month. Months never attempted keep no status at all, so a
-    # resume picks up at the exact point of interruption.
+    # Per-month EE + download loop with bounded retries and immediate checkpoints.
     # ------------------------------------------------------------------
     consecutive_failures = 0
 
@@ -2887,24 +2974,29 @@ def process_single_parameter(aoi, start_date, end_date, parameter_type, temp_dir
 
         # FIX C: Wrap every EE server call so a transient error skips the month
         try:
+            if callable(aoi):
+                aoi = aoi()
             if wq_collection is None:
                 wq_collection = create_water_quality_collection(
                     aoi, start_date, end_date, parameter_type, cloudy_pixel_percentage
                 )
-            composite, count, stats = get_monthly_composite(
-                wq_collection, aoi, month_info['year'], month_info['month']
+            composite, count, stats = _retry_ee_request(
+                lambda: get_monthly_composite(
+                    wq_collection, aoi, month_info['year'], month_info['month']
+                )
             )
-        except Exception:
-            # Network or EE error — mark as failed and continue to next month
+        except Exception as error:
+            message = _failure_message(error)
             st.session_state.month_statuses[parameter_type][month_name] = {
-                'status': STATUS_FAILED, 'message': 'EE request failed'
+                'status': STATUS_FAILED, 'message': message, 'stage': 'monthly_composite'
             }
+            st.session_state.last_run_error = f"{parameter_type} / {month_name}: {message}"
             _save_month_checkpoint(temp_dir, parameter_type, st.session_state.month_statuses[parameter_type])
             processed_count += 1
             if progress_callback:
                 progress_callback(processed_count, total_months, month_name)
 
-            consecutive_failures += 1
+            consecutive_failures = consecutive_failures + 1 if _is_transient_error(error) else 0
             if consecutive_failures >= NETWORK_FAILURE_STREAK:
                 st.session_state.connection_interrupted = True
                 break
@@ -2929,7 +3021,7 @@ def process_single_parameter(aoi, start_date, end_date, parameter_type, temp_dir
 
         # FIX D: Write to session state immediately after each month — not at end
         st.session_state.month_statuses[parameter_type][month_name] = {
-            'status': status, 'message': message
+            'status': status, 'message': message, 'stage': 'download'
         }
 
         if status == STATUS_COMPLETE:
@@ -2940,7 +3032,8 @@ def process_single_parameter(aoi, start_date, end_date, parameter_type, temp_dir
             }
             consecutive_failures = 0
         else:
-            consecutive_failures += 1
+            st.session_state.last_run_error = f"{parameter_type} / {month_name}: {message}"
+            consecutive_failures = consecutive_failures + 1 if _is_transient_error(message) else 0
 
         _save_month_checkpoint(temp_dir, parameter_type, st.session_state.month_statuses[parameter_type])
 
@@ -3059,8 +3152,9 @@ def run_full_analysis(aoi, start_date, end_date, cloudy_pixel_percentage=CLOUD_T
                 cloudy_pixel_percentage, scale, resume=resume,
                 progress_callback=make_progress_callback("🌊 مرحله ۱ از ۳ — شاخص کدورت آب", 0)
             )
-        except Exception:
-            pass  # Partial or zero results; pipeline continues to chlorophyll
+        except Exception as error:
+            st.session_state.last_run_error = f"{PARAM_TURBIDITY}: {_failure_message(error)}"
+            st.session_state.connection_interrupted = _is_transient_error(error)
 
         # Merge with any results already in session state (resume case)
         if turb_results:
@@ -3084,8 +3178,10 @@ def run_full_analysis(aoi, start_date, end_date, cloudy_pixel_percentage=CLOUD_T
                 cloudy_pixel_percentage, scale, resume=resume,
                 progress_callback=make_progress_callback("🌿 مرحله ۲ از ۳ — شاخص کلروفیل", total_months)
             )
-        except Exception:
-            pass  # Partial or zero results; still show whatever was collected
+        except Exception as error:
+            if not isinstance(error, InterruptedError):
+                st.session_state.last_run_error = f"{PARAM_CHLOROPHYLL}: {_failure_message(error)}"
+                st.session_state.connection_interrupted = _is_transient_error(error)
 
         if chl_results:
             st.session_state.results[PARAM_CHLOROPHYLL] = chl_results
@@ -3109,8 +3205,10 @@ def run_full_analysis(aoi, start_date, end_date, cloudy_pixel_percentage=CLOUD_T
                     "🍂 مرحله ۳ از ۳ — شاخص مواد آلی محلول", total_months * 2
                 )
             )
-        except Exception:
-            pass  # Partial or zero results; still show whatever was collected
+        except Exception as error:
+            if not isinstance(error, InterruptedError):
+                st.session_state.last_run_error = f"{PARAM_CDOM}: {_failure_message(error)}"
+                st.session_state.connection_interrupted = _is_transient_error(error)
 
         if cdom_results:
             st.session_state.results[PARAM_CDOM] = cdom_results
@@ -5608,6 +5706,9 @@ def _render_status_strip():
             st.session_state.processing_complete = False
             st.session_state.processing_in_progress = False
             st.session_state.pending_run = None
+            st.session_state.resume_after_interruption = False
+            st.session_state.connection_interrupted = False
+            st.session_state.last_run_error = None
             st.session_state.expert_analysis_json = None
             st.session_state.expert_analysis_signature = None
             st.session_state.executive_summary = None
@@ -6251,7 +6352,33 @@ def render_setup_page():
 
     st.caption("پس از اجرا، پیش‌پردازش (حذف ابر، حذف برف، استخراج بدنه آب)، سپس شاخص کدورت، شاخص کلروفیل و شاخص مواد آلی محلول به‌طور خودکار محاسبه می‌شوند.")
 
-    # Same three actions as change_detection_app: start, resume and retry failed.
+    if st.session_state.processing_in_progress:
+        if st.button('⏸️ توقف و حفظ پیشرفت', key='pause_monitoring'):
+            st.session_state.pending_run = None
+            st.session_state.processing_in_progress = False
+            st.session_state.resume_after_interruption = True
+            st.rerun()
+
+    selected_config = {
+        'polygon_coords': list(selected_polygon.exterior.coords),
+        'start_date': start.strftime('%Y-%m-%d'),
+        'end_date': end.strftime('%Y-%m-%d'),
+        'cloudy_pixel_percentage': CLOUD_THRESHOLD,
+        'scale': 10,
+    } if selected_polygon is not None else None
+
+    # Recover only the explicitly selected region/period after session loss.
+    # Never adopt the latest folder from another server user.
+    resume_config = st.session_state.processing_config
+    if resume_config is None and selected_config is not None:
+        candidate_dir = get_cache_dir_for_config(selected_config)
+        try:
+            if any(name.endswith('.tif') or name == RUN_STATE_FILE or name.startswith('bands_')
+                   for name in os.listdir(candidate_dir)):
+                resume_config = selected_config
+        except OSError:
+            pass  # A concurrently evicted folder must not hide the controls.
+
     btn_col1, btn_col2, btn_col3 = st.columns(3)
 
     start_btn = btn_col1.button(
@@ -6260,27 +6387,11 @@ def render_setup_page():
         disabled=st.session_state.processing_in_progress or selected_polygon is None
     )
 
-    # Show Resume only when THIS session has a run to carry on with. The app no
-    # longer goes looking on the server for some earlier run: doing that meant
-    # every fresh page load adopted whatever run happened to be newest on disk
-    # and announced it, even on first use. The download cache itself is
-    # untouched — it is still keyed on the region + date range.
-    has_partial_cache = any(
-        bool(st.session_state.downloaded_months.get(p)) or
-        bool(st.session_state.month_statuses.get(p))
-        for p in ALL_PARAMETERS
-    )
-    if not has_partial_cache and st.session_state.processing_config is not None:
-        try:
-            cache_dir = get_cache_dir_for_config(st.session_state.processing_config)
-            has_partial_cache = any(n.endswith('.tif') or n == RUN_STATE_FILE for n in os.listdir(cache_dir))
-        except Exception:
-            has_partial_cache = False
+    # Even an initialization failure before the first download must be retryable.
     resume_btn = btn_col2.button(
         "🔄 ادامه از محل قطع",
         disabled=(
-            not has_partial_cache or
-            st.session_state.processing_config is None or
+            resume_config is None or
             st.session_state.processing_in_progress
         ),
         help="اگر اتصال اینترنت قطع شد، پس از اتصال مجدد این دکمه را فشار دهید تا دانلود از همانجا ادامه یابد."
@@ -6297,57 +6408,48 @@ def render_setup_page():
     st.caption('تصاویر و نتایج کامل این محدوده و بازه زمانی از حافظه ذخیره‌شده استفاده می‌شوند؛ '
                'شروع پایش فایل‌های دریافت‌شده را پاک نمی‌کند.')
 
-    # --- Auto-continue after an interruption --------------------------------
-    # Streamlit rerun/stop signals leave processing_in_progress True, exactly
-    # like the reference app. Restore the stored run and reuse completed files.
-    auto_continue = (
-        not start_btn and not resume_btn and not retry_btn
-        and st.session_state.processing_in_progress
-        and st.session_state.processing_config is not None
-    )
-
     # --- A click only ARMS the run; the work happens on the next script run ---
     # Doing it this way means the whole page (map included) is already rendered
     # in its locked, read-only state before the long download loop begins — the
     # map therefore stays visible for the entire run and can no longer trigger a
     # rerun that would abort the processing halfway through.
     if start_btn:
-        _prepare_monitoring_run({
-            'polygon_coords': list(selected_polygon.exterior.coords),
-            'start_date': start.strftime('%Y-%m-%d'),
-            'end_date': end.strftime('%Y-%m-%d'),
-            'cloudy_pixel_percentage': CLOUD_THRESHOLD,
-            'scale': 10,
-        })
+        _prepare_monitoring_run(selected_config)
         st.rerun()
 
-    if (resume_btn or retry_btn) and st.session_state.processing_config is not None:
+    if (resume_btn or retry_btn) and resume_config is not None:
+        st.session_state.processing_config = resume_config
         st.session_state.processing_in_progress = True
         st.session_state.resume_after_interruption = False
         st.session_state.pending_run = 'resume'
         st.rerun()
 
-    # --- Execute the armed run (fresh start, manual resume, or auto-resume) ---
+    # Execute only a deliberate Start/Resume click. An abandoned busy flag must
+    # not repeatedly start the same failing request and lock every button again.
     pending = st.session_state.get('pending_run')
 
-    if (pending or auto_continue) and st.session_state.processing_config is not None:
+    if pending and st.session_state.processing_config is not None:
         config = st.session_state.processing_config
 
-        # Start also retains validated disk cache; only session-only progress
-        # differs. Resume/automatic continuation restore both cache layers.
+        # Start and Resume both retain validated disk cache.
         is_fresh = (pending == 'start')
 
-        if auto_continue and not pending:
-            st.info("🔄 اتصال اینترنت قطع شده بود؛ پایش از همان جا به‌طور خودکار ادامه می‌یابد...")
         _execute_monitoring_run(config, resume=not is_fresh)
         st.rerun()
 
     # Hint when a partial run can be resumed
     if st.session_state.resume_after_interruption and not st.session_state.processing_in_progress:
         st.warning(
-            "⚠️ پایش به دلیل قطعی اینترنت متوقف شد. "
-            "پس از اتصال مجدد، دکمه «ادامه از محل قطع» را فشار دهید."
+            "⚠️ پایش کامل نشده است؛ فایل‌های دریافت‌شده حفظ شده‌اند. "
+            "برای تلاش دوباره، دکمه «ادامه از محل قطع» را فشار دهید."
         )
+        with st.expander('جزئیات آخرین توقف و ماه‌های ناموفق'):
+            if st.session_state.get('last_run_error'):
+                st.text(st.session_state.last_run_error)
+            for parameter, statuses in st.session_state.month_statuses.items():
+                for month_name, entry in sorted(statuses.items()):
+                    if entry.get('status') == STATUS_FAILED:
+                        st.text(f"{parameter} / {month_name}: {entry.get('message', '')}")
 
     # --- Run status + clear-results action, directly under the run buttons ---
     _render_status_strip()
@@ -6402,21 +6504,12 @@ def render_setup_page():
 # Main Application — header, top navigation, then the active page
 # =============================================================================
 def main():
+    _recover_interrupted_run()
     _inject_global_app_css()
     _render_app_header()
 
-    # Initialize Earth Engine
-    ee_ok, ee_msg = initialize_earth_engine()
-    if not ee_ok:
-        st.error(ee_msg)
-        st.stop()
-
-    # Safety valve: a run can never be "in progress" without a configuration to
-    # run — otherwise every button would stay disabled forever.
-    if st.session_state.processing_in_progress and st.session_state.processing_config is None \
-            and not st.session_state.get('pending_run'):
-        st.session_state.processing_in_progress = False
-
+    # Render controls and cached results even while Earth Engine is unavailable.
+    # Initialization is attempted only when the user starts/resumes a run.
     # While a run is in progress the app always stays on the first page, so the
     # progress bar and the resume logic remain visible to the user.
     if st.session_state.processing_in_progress:
