@@ -1,5 +1,5 @@
 """
-Water Quality Monitoring Application — Version 18
+Water Quality Monitoring Application — Version 17
 =====================================
 Sentinel-2 based automatic calculation of:
   - Water Turbidity (NDTI)
@@ -16,7 +16,7 @@ Version 17 adds embedded Persian chart typography, parameter-specific display
 thresholds, a separate coverage view and verified atomic cache writes.
 Scientific equations, geospatial events, exports and the AI agent are preserved.
 Launch in the existing environment with:
-    streamlit run code_water_monitoring_version_18.py
+    streamlit run code_water_monitoring_version_17_1405.py
 """
 
 import os
@@ -39,9 +39,6 @@ import json
 import inspect
 import hashlib
 import shutil
-import threading
-import unicodedata
-from html import escape as _wq_escape_html
 from datetime import date
 from PIL import Image
 
@@ -52,7 +49,7 @@ import streamlit as st
 
 st.set_page_config(
     layout="wide",
-    page_title="سامانه پایش کیفیت آب | نسخه ۱۸",
+    page_title="سامانه پایش کیفیت آب | نسخه ۱۷",
     page_icon="🌊"
 )
 
@@ -1892,18 +1889,6 @@ if 'active_page' not in st.session_state:
     # Which of the four top-navigation pages is currently shown:
     # 'setup' | 'turbidity' | 'chlorophyll' | 'chat'
     st.session_state.active_page = 'setup'
-
-# Search state is independent of ROI, monitoring, dates, exports and disk caches.
-if 'wq_water_search_results' not in st.session_state:
-    st.session_state.wq_water_search_results = []
-if 'wq_water_search_message' not in st.session_state:
-    st.session_state.wq_water_search_message = None
-if 'wq_water_search_selected' not in st.session_state:
-    st.session_state.wq_water_search_selected = None
-if 'wq_water_search_revision' not in st.session_state:
-    st.session_state.wq_water_search_revision = 0
-if 'wq_water_search_generation' not in st.session_state:
-    st.session_state.wq_water_search_generation = 0
 
 
 # =============================================================================
@@ -5954,247 +5939,6 @@ def _add_area_label(layer, polygon, text, color):
     ).add_to(layer)
 
 
-# =============================================================================
-# Iranian waterbody name search (UI only; no monitoring or agent calls)
-# =============================================================================
-def _wq_normalize_search_text(text):
-    """Canonical Persian/Arabic spelling, spacing and English case for caching."""
-    if not isinstance(text, str):
-        return ""
-    text = unicodedata.normalize("NFKC", text).translate(str.maketrans({
-        "ي": "ی", "ى": "ی", "ك": "ک", "ة": "ه", "ۀ": "ه",
-        "أ": "ا", "إ": "ا", "ٱ": "ا", "ـ": "", "\u200c": " ",
-        "\u200d": "", "\u200e": "", "\u200f": "",
-    }))
-    text = "".join(c for c in text if not unicodedata.combining(c))
-    return " ".join(text.split()).casefold()
-
-
-def _wq_water_type(item):
-    """Require OSM water tags/categories; a water-like name alone is insufficient."""
-    if not isinstance(item, dict):
-        return None
-    category = item.get("category") or item.get("class") or ""
-    feature = item.get("type") or ""
-    tags = item.get("extratags") or {}
-    if not isinstance(category, str) or not isinstance(feature, str) or not isinstance(tags, dict):
-        return None
-    category, feature = category.lower(), feature.lower()
-    if category and category not in {"natural", "water", "waterway", "landuse", "man_made"}:
-        return None
-    if tags.get("building") not in (None, "no", "false", "0"):
-        return None
-    kinds = {
-        "lake": "دریاچه", "reservoir": "دریاچه سد", "pond": "آبگیر",
-        "basin": "حوضچه", "lagoon": "تالاب ساحلی", "oxbow": "دریاچه هلالی",
-        "river": "رودخانه", "riverbank": "رودخانه", "stream": "آبراهه",
-        "canal": "کانال آب", "dam": "سد", "weir": "بند آب",
-    }
-    waterway = tags.get("waterway") or (feature if category == "waterway" else "")
-    if isinstance(waterway, str) and waterway in kinds:
-        return kinds[waterway]
-    if (category == "natural" and feature == "wetland") or tags.get("natural") == "wetland":
-        return "تالاب"
-    if (category == "landuse" and feature in {"reservoir", "basin"}):
-        return kinds[feature]
-    if tags.get("landuse") in ("reservoir", "basin"):
-        return kinds[tags["landuse"]]
-    if (category == "man_made" and feature in {"dam", "weir"}):
-        return kinds[feature]
-    if ((category == "natural" and feature == "water") or tags.get("natural") == "water"
-            or category == "water"):
-        water = tags.get("water") or (feature if category == "water" else "")
-        return kinds.get(water, "پهنه آبی") if isinstance(water, str) else None
-    return None
-
-
-def _wq_parse_osm_result(item):
-    """Keep only usable water locations; bounds are a viewport hint, never an ROI."""
-    kind = _wq_water_type(item)
-    if kind is None:
-        return None
-    address = item.get("address") or {}
-    if not isinstance(address, dict):
-        return None
-    country = address.get("country_code")
-    if country is not None and (not isinstance(country, str) or country.lower() != "ir"):
-        return None
-    try:
-        if isinstance(item.get("lat"), bool) or isinstance(item.get("lon"), bool):
-            return None
-        lat, lon = float(item["lat"]), float(item["lon"])
-    except (KeyError, TypeError, ValueError, OverflowError):
-        return None
-    if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
-        return None
-    names = item.get("namedetails") or {}
-    if not isinstance(names, dict):
-        names = {}
-    display = item.get("display_name")
-    display = display.strip() if isinstance(display, str) else ""
-    candidates = [names.get("name:fa"), item.get("name"), names.get("name"),
-                  names.get("name:en"), display.split(",")[0]]
-    name = next((n.strip() for n in candidates if isinstance(n, str) and n.strip()), "")
-    if not name:
-        return None
-    bounds = None
-    raw_bounds = item.get("boundingbox")
-    if isinstance(raw_bounds, (list, tuple)) and len(raw_bounds) == 4:
-        try:
-            south, north, west, east = map(float, raw_bounds)
-            if (all(math.isfinite(v) for v in (south, north, west, east))
-                    and -90 <= south < north <= 90 and -180 <= west < east <= 180
-                    and south <= lat <= north and west <= lon <= east):
-                bounds = [[south, west], [north, east]]
-        except (TypeError, ValueError, OverflowError):
-            pass
-    osm_type, osm_id = item.get("osm_type"), item.get("osm_id")
-    if osm_type in ("node", "way", "relation") and str(osm_id).isdigit():
-        identity = f"{osm_type}:{osm_id}"
-    else:
-        identity = f"{_wq_normalize_search_text(name)}:{lat:.5f}:{lon:.5f}"
-    label = f"{name} — {kind}"
-    if display and display != name:
-        label += f" | {display}"
-    return {"id": identity, "name": name, "label": label, "kind": kind,
-            "lat": lat, "lon": lon, "bounds": bounds}
-
-
-@st.cache_resource(show_spinner=False)
-def _wq_water_search_gate():
-    """One gate across all Streamlit sessions in this process, not per user.
-
-    Public Nominatim: https://operations.osmfoundation.org/policies/nominatim/
-    Multiple workers/replicas require a centrally coordinated limiter or a
-    provider sized for their combined traffic; this local gate is insufficient.
-    """
-    return {"lock": threading.Lock(), "last_request": None}
-
-
-@st.cache_data(ttl=24 * 60 * 60, max_entries=256, show_spinner=False)
-def _wq_search_iran_waterbodies(query, endpoint, contact):
-    """One bounded request per explicit, uncached query; failures are not cached.
-
-    WQ_NOMINATIM_CONTACT must identify the operator (real email or app URL).
-    WQ_NOMINATIM_URL can switch to a compatible provider without source edits.
-    No autocomplete, retries, polygon download, EE or LLM operations occur here.
-    """
-    if not query or len(query) > 160 or not contact or any(c in contact for c in "\r\n"):
-        raise ValueError("Invalid search or missing operator contact")
-    gate = _wq_water_search_gate()
-    if not gate["lock"].acquire(timeout=2):
-        raise requests.RequestException("Geographic search is busy")
-    try:
-        if gate["last_request"] is not None:
-            delay = 1.05 - (time.monotonic() - gate["last_request"])
-            if delay > 0:
-                time.sleep(delay)
-        gate["last_request"] = time.monotonic()
-        response = requests.get(
-            endpoint,
-            params={"q": query, "format": "jsonv2", "countrycodes": "ir",
-                    "limit": 20, "addressdetails": 1, "extratags": 1,
-                    "namedetails": 1, "accept-language": "fa,en", "dedupe": 1},
-            headers={"User-Agent": f"WaterQualityMonitoring/18 ({contact})",
-                     "Accept-Language": "fa,en"},
-            timeout=(3, 6), allow_redirects=False,
-        )
-    finally:
-        gate["lock"].release()
-    response.raise_for_status()
-    if response.status_code != 200:
-        raise ValueError("Unexpected geographic service response")
-    payload = response.json()
-    if not isinstance(payload, list):
-        raise ValueError("Invalid geographic service response")
-    results, seen_ids, seen_locations = [], set(), set()
-    for raw in payload[:20]:
-        result = _wq_parse_osm_result(raw)
-        if result is None:
-            continue
-        location = (_wq_normalize_search_text(result["name"]),
-                    round(result["lat"], 4), round(result["lon"], 4))
-        if result["id"] in seen_ids or location in seen_locations:
-            continue
-        seen_ids.add(result["id"])
-        seen_locations.add(location)
-        results.append(result)
-        if len(results) == 10:
-            break
-    return results
-
-
-def _render_waterbody_search():
-    """Search only on form submission; selecting a cached result is local UI state."""
-    busy = st.session_state.processing_in_progress
-    with st.form("wq_water_search_form"):
-        text_col, button_col = st.columns([5, 1])
-        with text_col:
-            query = st.text_input(
-                "جستجوی پهنه‌های آبی ایران", key="wq_water_search_text",
-                placeholder="مثلاً: سد لار، دریاچه ارومیه، تالاب انزلی یا Lake Urmia",
-                max_chars=160, disabled=busy,
-            )
-        with button_col:
-            submitted = st.form_submit_button("🔎 جستجو", disabled=busy, use_container_width=True)
-    if submitted and not busy:
-        query = _wq_normalize_search_text(query)
-        st.session_state.wq_water_search_results = []
-        st.session_state.wq_water_search_generation += 1
-        if not query:
-            st.session_state.wq_water_search_message = ("warning", "نام یک دریاچه، سد یا تالاب را وارد کنید.")
-        else:
-            contact = os.environ.get("WQ_NOMINATIM_CONTACT", "").strip()
-            endpoint = os.environ.get("WQ_NOMINATIM_URL", "https://nominatim.openstreetmap.org/search").strip()
-            if not contact:
-                st.session_state.wq_water_search_message = (
-                    "warning", "جستجوی مکانی هنوز توسط مدیر سامانه پیکربندی نشده است؛ می‌توانید منطقه را دستی رسم کنید."
-                )
-            else:
-                try:
-                    with st.spinner("در حال جستجوی پهنه‌های آبی…"):
-                        results = _wq_search_iran_waterbodies(query, endpoint, contact)
-                    st.session_state.wq_water_search_results = results
-                    st.session_state.wq_water_search_message = (
-                        "info", "پهنه آبی مطابقی پیدا نشد؛ نام دیگر یا املای فارسی/انگلیسی را امتحان کنید یا منطقه را دستی رسم کنید."
-                    ) if not results else None
-                except (requests.RequestException, ValueError):
-                    st.session_state.wq_water_search_message = (
-                        "warning", "سرویس جستجوی مکانی در دسترس نیست؛ دوباره تلاش کنید یا منطقه را دستی روی نقشه رسم کنید."
-                    )
-    message = st.session_state.wq_water_search_message
-    if message:
-        getattr(st, message[0])(message[1])
-    results = st.session_state.wq_water_search_results
-    if results:
-        generation = st.session_state.wq_water_search_generation
-        selected = st.selectbox(
-            "نتایج جستجوی پهنه‌های آبی", options=range(len(results)), index=None,
-            placeholder="یک نتیجه را برای نمایش روی نقشه انتخاب کنید",
-            format_func=lambda i: results[i]["label"],
-            key=f"wq_water_search_choice_{generation}", disabled=busy,
-        )
-        if selected is not None and not busy:
-            chosen = results[selected]
-            if chosen != st.session_state.wq_water_search_selected:
-                st.session_state.wq_water_search_selected = chosen
-                st.session_state.wq_water_search_revision += 1
-    if st.session_state.wq_water_search_selected is not None:
-        st.caption("📍 نشان مکان فقط برای یافتن پهنه آبی است؛ محدوده پایش را با ابزار چندضلعی یا مستطیل رسم کنید.")
-        if st.button("پاک کردن نشان جستجو", key="wq_water_search_clear", disabled=busy):
-            st.session_state.wq_water_search_selected = None
-            st.session_state.wq_water_search_results = []
-            st.session_state.wq_water_search_message = None
-            st.session_state.wq_water_search_generation += 1
-            st.session_state.wq_water_search_revision += 1
-            st.rerun()
-    st.caption(
-        "منبع: [© مشارکت‌کنندگان OpenStreetMap](https://www.openstreetmap.org/copyright) · "
-        "[Nominatim](https://operations.osmfoundation.org/policies/nominatim/). "
-        "پوشش جستجو کامل نیست؛ همیشه می‌توانید محدوده را دستی رسم کنید."
-    )
-
-
 def _build_roi_map(interactive=True, highlight_index=None):
     """Build the ROI map with every saved region drawn as a permanent layer."""
     saved = list(st.session_state.drawn_polygons)
@@ -6212,17 +5956,7 @@ def _build_roi_map(interactive=True, highlight_index=None):
     else:
         center = [35.6892, 51.3890]
 
-    search_location = st.session_state.get('wq_water_search_selected')
-    if search_location is not None:
-        center = [search_location['lat'], search_location['lon']]
-
-    fmap = folium.Map(location=center, zoom_start=12 if search_location else 8, control_scale=True)
-    if search_location is not None:
-        folium.Marker(
-            location=center,
-            tooltip=_wq_escape_html(search_location['label']).translate({96: '&#96;', 36: '&#36;', 92: '&#92;'}),
-            icon=folium.Icon(color='blue', icon='info-sign'),
-        ).add_to(fmap)
+    fmap = folium.Map(location=center, zoom_start=8, control_scale=True)
 
     folium.TileLayer(
         tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
@@ -6291,10 +6025,7 @@ def _build_roi_map(interactive=True, highlight_index=None):
     roi_layer.add_to(fmap)
     folium.LayerControl(collapsed=True).add_to(fmap)
 
-    if search_location is not None:
-        if search_location['bounds'] is not None:
-            fmap.fit_bounds(search_location['bounds'], padding=(25, 25), max_zoom=13)
-    elif shapes:
+    if shapes:
         fmap.fit_bounds([[ys_min, xs_min], [ys_max, xs_max]], padding=(25, 25))
 
     return fmap
@@ -6317,9 +6048,6 @@ def _render_roi_map():
         # The version suffix forces a fresh widget after a save or a delete, so
         # the drawing toolbar cannot hand back a region the user just removed.
         version = st.session_state.map_version
-        search_revision = st.session_state.get('wq_water_search_revision', 0)
-        if search_revision:
-            version = f"{version}_search_{search_revision}"
 
         if busy:
             # returned_objects=[] -> the component never sends data back, so the
@@ -6414,7 +6142,6 @@ def render_setup_page():
     # ==========================================================================
     _render_step_header(1, "🗺️", "انتخاب منطقه مورد نظر (بدنه آبی)")
 
-    _render_waterbody_search()
     _render_roi_map()
 
     if st.session_state.drawn_polygons:
