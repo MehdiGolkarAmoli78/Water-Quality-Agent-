@@ -15,7 +15,8 @@ jargon, no parameter pickers, no processing logs.
 Version 18 repairs interrupted downloads, cache recovery, authentication retries
 and resume controls. Embedded Persian typography, parameter-specific display
 thresholds, the coverage view and validated atomic cache writes are retained.
-Scientific equations, geospatial events, exports and the AI agent are preserved.
+Scientific equations, geospatial events and exports are preserved. Expert chat
+streams responses with a longer model timeout and bounded weather research.
 Launch in the existing environment with:
     streamlit run code_water_monitoring_version_18_1405.py
 """
@@ -4396,7 +4397,7 @@ QUICK_DEEP_PROMPT = """یک تحلیل کامل، دقیق و حرفه‌ای ا
 ۲. وضعیت هر سه جنبه کیفیت آب به‌صورت جداگانه: میانگین، دامنه تغییرات، بیشینه و کمینه و ماهی که در آن رخ داده است.
 ۳. روند بلندمدت هر جنبه بر پایه آزمون روند: جهت روند، معنادار بودن یا نبودن آن، و شیب تغییر.
 ۴. الگوی فصلی: کدام ماه‌ها یا فصل‌ها به‌طور سیستماتیک بدترین و کدام بهترین وضعیت را دارند.
-۵. ناهنجاری‌ها: ماه‌های غیرعادی را فهرست کن و برای مهم‌ترین آن‌ها با ابزار داده‌های هواشناسی، علت محتمل
+۵. ناهنجاری‌ها: ماه‌های غیرعادی را فهرست کن و برای حداکثر چهار ماه مهم و متمایز با ابزار داده‌های هواشناسی، علت محتمل
    (بارش شدید، ذوب برف، باد، دمای بالا) را بررسی و بیان کن.
 ۶. رابطه میان جنبه‌های کیفیت آب: همبستگی‌های موجود را تفسیر کن و توضیح بده چه فرایند محیطی می‌تواند آن را توجیه کند.
 ۷. کیفیت و محدودیت داده: درصد پوشش آب، ماه‌های بدون داده، و هر محدودیتی که نتیجه‌گیری را محتاطانه می‌کند.
@@ -4502,6 +4503,14 @@ def _build_agent_system_prompt(analysis_json):
   موردنظر را با get_monthly_weather_stats بگیرید؛ و در صورت نیاز، زمینه‌ی کلی اقلیمی یا رویدادهای خاص
   را نیز با tavily_search تکمیل کنید.
 
+محدودیت بررسی در هر پاسخ:
+- از میان ماه‌های ناهنجاری، بیشینه/کمینه و روند، حداکثر چهار ماه متمایز و مهم را برای بررسی هواشناسی
+  انتخاب کنید؛ لازم نیست برای تک‌تک موارد ابزار فراخوانی شود. ماه مشترک بین چند شاخص را تکرار نکنید.
+- فراخوانی‌های مستقل را در یک مرحله انجام دهید و حداکثر در سه مرحله از ابزارها استفاده کنید؛ سپس
+  پاسخ را با شواهد موجود تکمیل کنید. ابزار ناموفق را در همان پاسخ دوباره فراخوانی نکنید.
+- اگر ابزار در دسترس نبود یا سقف بررسی تکمیل شد، همه بخش‌های تحلیل آب را از داده‌های موجود بنویسید
+  و محدودیت بررسی علت هواشناسی را صریح بگویید. رابطه آماری به‌تنهایی اثبات علت نیست.
+
 دستورالعمل‌های مربوط به تاریخ (تقویم شمسی):
 - کاربر با تقویم شمسی (جلالی) صحبت می‌کند و تاریخ‌ها را در پاسخ‌های خود باید به همین صورت (مثلاً «مرداد
   ۱۴۰۳») بیان کنید، مگر آنکه خود کاربر از تقویم میلادی استفاده کند.
@@ -4544,30 +4553,10 @@ def _build_agent_system_prompt(analysis_json):
 # نظر متخصص آب — Cached network helpers (reverse geocoding + historical
 # weather)
 # =============================================================================
-# WHY THIS EXISTS: a monitored waterbody's center coordinates never move, and
-# historical (past-month) weather data never changes once the month is over.
-# Before this fix, both the reverse-geocode and the monthly-weather calls
-# hit their external APIs fresh on every single agent turn — and a single
-# user question can trigger several of these calls in sequence (identify
-# region -> weather for month A -> weather for month B -> ...). Each call
-# also had a generous 30s timeout with no cap on the *total* turn time, so a
-# multi-tool question could run 60-90+ seconds while fully blocking
-# Streamlit's script thread. During that time Streamlit can't send its
-# normal keep-alive traffic, and Posit's reverse proxy (or any proxy in
-# front of it) has its own idle/read timeout — commonly ~60s — and simply
-# drops the connection from the outside once that's exceeded. Nothing raises
-# a Python exception in that case, so the existing try/except in
-# render_expert_chat_tab() never fires either: the user just sees no
-# response at all.
-#
-# THE FIX: cache both lookups to disk with st.cache_data(persist="disk").
-# The first time a region/month is asked about, the API is still called
-# once; every question after that — for that region, for that month, by any
-# user in any session on this deployment — is served instantly from cache
-# with zero network round-trips. This removes almost all of the latency
-# that was tripping the proxy's idle timeout. Per-call timeouts are also
-# tightened from 30s to a (connect=5s, read=15s) tuple so an unresponsive
-# API fails fast instead of silently eating the whole time budget.
+# Disk caching avoids repeated location/weather requests. It does not change
+# the LLM client's own read timeout: a caught "Request timed out." can still
+# originate there. Streaming and the model timeout are configured separately
+# below. These per-request timeouts are not a whole-turn wall-clock deadline.
 # =============================================================================
 @st.cache_data(ttl=None, persist="disk", show_spinner=False)
 def _reverse_geocode_cached(lat: float, lon: float) -> list:
@@ -4620,6 +4609,60 @@ def _fetch_monthly_weather_cached(lat: float, lon: float, year: int, month: int)
     return r.json()
 
 
+EXPERT_REQUEST_TIMEOUT_SECONDS = 180
+EXPERT_MAX_WEATHER_MONTHS = 4
+EXPERT_RECURSION_LIMIT = 16
+
+
+def _get_expert_model():
+    """Allow slow report generation without silently replaying a paid request.
+
+    Streaming limits each read's wait for new bytes; this is an inactivity
+    timeout, not a total generation deadline. The gateway may impose its own
+    shorter limit, which must be diagnosed on the deployment if it persists.
+    """
+    from langchain.chat_models import init_chat_model
+
+    return init_chat_model(
+        model=EXPERT_CHAT_MODEL,
+        model_provider="openai",
+        base_url=OPENAI_BASE_URL,
+        api_key=OPENAI_API_KEY,
+        temperature=0.3,
+        timeout=EXPERT_REQUEST_TIMEOUT_SECONDS,
+        max_retries=0,
+        streaming=True,
+    )
+
+
+def _summarize_expert_weather(daily):
+    """Summarize observed values; missing weather must not become zero rain/snow."""
+    import math
+
+    def observed(key):
+        return [float(value) for value in (daily.get(key) or [])
+                if isinstance(value, (int, float)) and math.isfinite(value)]
+
+    high = observed("temperature_2m_max")
+    low = observed("temperature_2m_min")
+    rain = observed("precipitation_sum")
+    snow = observed("snowfall_sum")
+    wind = observed("wind_speed_10m_max")
+    snow_days = sum(value > 0 for value in snow) if snow else None
+    return {
+        "total_days": len(daily.get("time") or []),
+        "snowfall_observed_days": len(snow),
+        "snow_days": snow_days,
+        "snow_day_percentage": round(100 * snow_days / len(snow), 1) if snow else None,
+        "temperature_max_monthly": max(high) if high else None,
+        "temperature_min_monthly": min(low) if low else None,
+        "precipitation_monthly": sum(rain) if rain else None,
+        "precipitation_observed_days": len(rain),
+        "snowfall_monthly": sum(snow) if snow else None,
+        "wind_speed_max_monthly": max(wind) if wind else None,
+    }
+
+
 def _get_expert_agent(analysis_json):
     """
     Build a fresh LangGraph ReAct agent with the three tools: OpenWeatherMap
@@ -4643,7 +4686,7 @@ def _get_expert_agent(analysis_json):
     Requires: langchain, langchain-openai, langgraph, langchain-tavily
     (pip install langchain langchain-openai langgraph langchain-tavily)
     """
-    from langchain.chat_models import init_chat_model
+    from threading import Lock
     from langchain_core.tools import tool
     from langchain_tavily import TavilySearch
     from langgraph.prebuilt import create_react_agent
@@ -4652,15 +4695,9 @@ def _get_expert_agent(analysis_json):
     # the hardcoded constant above (no .env involved).
     os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
 
-    model = init_chat_model(
-        model=EXPERT_CHAT_MODEL,
-        model_provider="openai",
-        base_url=OPENAI_BASE_URL,
-        api_key=OPENAI_API_KEY,
-        temperature=0.3,
-        timeout=45,      # hard per-call cap on the LLM request itself
-        max_retries=1,   # avoid a silent retry doubling the wait on a slow endpoint
-    )
+    model = _get_expert_model()
+    weather_months = set()
+    weather_lock = Lock()  # a single model turn can request tools concurrently
 
     tavily_tool = TavilySearch(max_results=5, topic="general")
 
@@ -4713,48 +4750,95 @@ def _get_expert_agent(analysis_json):
         precipitation or rapid snowmelt, or a chlorophyll rise coinciding with
         calm, warm, low-wind conditions favorable to algal blooms).
 
-        Call this tool proactively — as a normal, automatic step of your own
-        analysis — for the month(s) around any anomaly in `anomalies`, around
-        `extremes.minimum` / `extremes.maximum`, and around representative
-        months of any statistically significant trend, even if the user never
-        explicitly asks about the weather. Do not wait for the user to ask
-        'what was the weather like' before checking; treat this the way a
-        human water-quality expert would instinctively pull rainfall/snowmelt
-        records before offering an interpretation of an unusual reading.
+        Proactively select up to four important distinct months from anomalies,
+        extremes or significant trends. Reuse a month shared by several water
+        indices. Do not retry failed lookups in this answer. Once the budget is
+        reached, finish the water-quality report with available evidence and
+        explicitly state the limits on weather-based explanations.
 
         Always pass the center_latitude / center_longitude already present in
         the analysis JSON, and the Gregorian year/month equivalent of the
         month you are investigating (convert internally from Shamsi/Jalali if
         that is how the user phrased the date) — never ask the user for
         coordinates or for the Gregorian date."""
+        weather_key = (round(lat, 3), round(lon, 3), year, month)
+        with weather_lock:
+            if weather_key in weather_months:
+                return str({"error": "This month was already checked in this answer; use its earlier result, or state that it was unavailable."})
+            if len(weather_months) >= EXPERT_MAX_WEATHER_MONTHS:
+                return str({"error": "Weather lookup limit reached. Complete the report using available evidence and disclose unverified weather causes."})
+            weather_months.add(weather_key)
         try:
             data = _fetch_monthly_weather_cached(lat, lon, year, month)
         except Exception as e:
             return str({"error": f"weather service unavailable or timed out: {e}"})
 
         daily = data.get("daily", {})
-        snowfall = daily.get("snowfall_sum", [])
-        total_days = len(daily.get("time", []))
-        snow_days = sum(1 for s in snowfall if s and s > 0)
-        snow_pct = round(100 * snow_days / total_days, 1) if total_days else None
-
-        data["summary"] = {
-            "total_days": total_days,
-            "snow_days": snow_days,
-            "snow_day_percentage": snow_pct,
-            "temperature_max_monthly": daily.get("temperature_2m_max"),
-            "temperature_min_monthly": daily.get("temperature_2m_min"),
-            "precipitation_monthly": daily.get("precipitation_sum"),
-            "snowfall_monthly": snowfall,
-        }
+        # Preserve daily evidence once; do not duplicate the arrays as "summary".
+        data = dict(data, summary=_summarize_expert_weather(daily))
         return str(data)
 
     tools = [reverse_geocode, tavily_tool, get_monthly_weather_stats]
+    try:
+        analysis_json = json.dumps(json.loads(analysis_json), ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        pass
     system_prompt = _build_agent_system_prompt(analysis_json)
     return create_react_agent(model, tools, prompt=system_prompt)
 
 
-def ask_water_quality_expert(question, analysis_json, chat_history):
+def _expert_history_messages(chat_history):
+    """Keep at most six recent complete, successful exchanges within 24k chars."""
+    pairs = []
+    pending = None
+    for message in chat_history:
+        if message.get("role") == "user":
+            pending = message
+        elif message.get("role") == "assistant":
+            if (pending is not None and not message.get("error")
+                    and not message.get("content", "").startswith("خطا در ارتباط با عامل هوش مصنوعی:")):
+                pairs.append((pending, message))
+            pending = None
+    recent = []
+    size = 0
+    for pair in reversed(pairs[-6:]):
+        pair_size = sum(len(message.get("content", "")) for message in pair)
+        if size + pair_size > 24000:
+            break
+        recent.insert(0, pair)
+        size += pair_size
+    return [message for pair in recent for message in pair]
+
+
+def _expert_message_text(content):
+    """Display text only, excluding reasoning and tool-call content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(block.get("text", "") for block in content
+                       if isinstance(block, dict) and block.get("type") == "text"
+                       and isinstance(block.get("text"), str))
+    return ""
+
+
+def _expert_error_message(error):
+    # Keep the original dependency/configuration error visible if the chatbot
+    # packages themselves are missing; error rendering must not import-fail.
+    try:
+        from openai import APITimeoutError
+        timeout_errors = (TimeoutError, APITimeoutError)
+    except ImportError:
+        timeout_errors = (TimeoutError,)
+
+    if isinstance(error, timeout_errors):
+        return ("پاسخ سرویس هوش مصنوعی در زمان مجاز دریافت نشد. لطفاً دوباره تلاش کنید. "
+                "اگر این خطا تکرار شد، اتصال سرور برنامه به سرویس هوش مصنوعی و محدودیت زمان سرویس بررسی شود.")
+    if any(cls.__name__ == "GraphRecursionError" for cls in type(error).__mro__):
+        return "تعداد مراحل بررسی به سقف مجاز رسید. لطفاً پرسش را به یک موضوع یا بازه کوتاه‌تر محدود کنید."
+    return f"خطا در ارتباط با عامل هوش مصنوعی: {error}"
+
+
+def ask_water_quality_expert(question, analysis_json, chat_history, on_text=None, on_progress=None):
     """
     Send `question` to the water-quality expert agent, giving it the running
     chat history for context. chat_history is a list of
@@ -4767,15 +4851,63 @@ def ask_water_quality_expert(question, analysis_json, chat_history):
     agent = _get_expert_agent(analysis_json)
 
     messages = []
-    for msg in chat_history:
+    for msg in _expert_history_messages(chat_history):
         if msg["role"] == "user":
             messages.append(HumanMessage(content=msg["content"]))
         else:
             messages.append(AIMessage(content=msg["content"]))
     messages.append(HumanMessage(content=question))
 
-    result = agent.invoke({"messages": messages})
-    return result["messages"][-1].content
+    answer = ""
+    partial = ""
+    message_id = None
+    tool_labels = {
+        "reverse_geocode": "در حال شناسایی منطقه…",
+        "get_monthly_weather_stats": "در حال بررسی داده‌های هواشناسی ماه‌های منتخب…",
+        "tavily_search": "در حال بررسی منابع تکمیلی…",
+    }
+    if on_progress:
+        on_progress("در حال تحلیل داده‌های آب؛ تهیه گزارش جامع ممکن است چند دقیقه طول بکشد…")
+    for mode, event in agent.stream(
+        {"messages": messages},
+        config={"recursion_limit": EXPERT_RECURSION_LIMIT},
+        stream_mode=["messages", "updates"],
+    ):
+        if mode == "messages":
+            chunk, metadata = event
+            if metadata.get("langgraph_node") != "agent":
+                continue
+            chunk_id = getattr(chunk, "id", None)
+            if chunk_id != message_id:
+                partial = ""
+                message_id = chunk_id
+            partial += _expert_message_text(chunk.content)
+            if on_text and partial and not getattr(chunk, "tool_call_chunks", None):
+                on_text(partial)
+        elif mode == "updates":
+            for node, update in event.items():
+                if node != "agent" or not isinstance(update, dict):
+                    continue
+                for message in update.get("messages", []):
+                    calls = getattr(message, "tool_calls", None)
+                    if calls:
+                        partial = ""
+                        message_id = None
+                        if on_text:
+                            on_text("")
+                        if on_progress:
+                            on_progress(tool_labels.get(calls[0].get("name"), "در حال بررسی شواهد تکمیلی…"))
+                    else:
+                        answer = _expert_message_text(message.content)
+                        # LangGraph can end with this sentinel instead of raising
+                        # GraphRecursionError when its remaining steps run low.
+                        if answer.strip() == "Sorry, need more steps to process this request.":
+                            raise RuntimeError("تعداد مراحل بررسی به سقف مجاز رسید؛ لطفاً پرسش را به یک موضوع یا بازه کوتاه‌تر محدود کنید.")
+                        if on_text:
+                            on_text(answer)
+    if not answer.strip():
+        raise RuntimeError("سرویس هوش مصنوعی پاسخ متنی کامل برنگرداند؛ لطفاً دوباره تلاش کنید.")
+    return answer
 
 
 def _inject_persian_chat_css():
@@ -5112,18 +5244,26 @@ def render_expert_chat_tab():
             st.markdown(display_text or user_question)
 
         with st.chat_message("assistant"):
+            progress = st.empty()
+            response = st.empty()
+            failed = False
             with st.spinner("در حال بررسی توسط متخصص هوش مصنوعی..."):
                 try:
                     answer = ask_water_quality_expert(
                         user_question,
                         st.session_state.expert_analysis_json,
-                        st.session_state.expert_chat_history[:-1]
+                        st.session_state.expert_chat_history[:-1],
+                        on_text=response.markdown,
+                        on_progress=progress.caption,
                     )
                 except Exception as e:
-                    answer = f"خطا در ارتباط با عامل هوش مصنوعی: {e}"
-                st.markdown(answer)
+                    failed = True
+                    answer = _expert_error_message(e)
+                finally:
+                    progress.empty()
+                response.markdown(answer)
 
-        st.session_state.expert_chat_history.append({"role": "assistant", "content": answer})
+        st.session_state.expert_chat_history.append({"role": "assistant", "content": answer, "error": failed})
 
 
 # =============================================================================
